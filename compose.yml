@@ -1,0 +1,180 @@
+services:
+  envoy-gateway:
+    container_name: 'envoy-gateway'
+    image: 'envoyproxy/envoy:v1.31-latest'
+    ports: [ '3000:3000', '9901:9901' ]
+    volumes:
+      - './deployments/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro'
+      - './deployments/envoy/backend.pb:/etc/envoy/descriptors/backend.pb:ro'
+    networks: [ 'task-backend' ]
+
+  auth-service:
+    container_name: 'auth-service'
+    image: 'ghcr.io/jewish-baikal-autonomy-territory/auth-service:latest'
+    env_file: [ '.env.auth' ]
+    networks: [ 'task-backend' ]
+    depends_on:
+      postgres:
+        condition: 'service_healthy'
+      event-bus:
+        condition: 'service_healthy'
+
+  task-service:
+    container_name: 'task-service'
+    image: 'ghcr.io/jewish-baikal-autonomy-territory/task-service:latest'
+    env_file: [ '.env.task' ]
+    networks: [ 'task-backend' ]
+    depends_on:
+      postgres:
+        condition: 'service_healthy'
+      event-bus:
+        condition: 'service_healthy'
+      otlp-collector:
+        condition: 'service_started'
+
+  postgres:
+    container_name: 'postgres'
+    build:
+      context: '.'
+      dockerfile: './deployments/postgres/Dockerfile'
+    environment:
+      POSTGRES_USER: 'postgres'
+      POSTGRES_DB: 'postgres'
+      POSTGRES_PASSWORD: 'postgres-password'
+    volumes:
+      - 'postgis-data:/var/lib/postgresql'
+      - './deployments/postgres/scripts/:/docker-entrypoint-initdb.d/:ro'
+      - './deployments/postgres/config/postgresql.conf:/etc/postgresql/postgresql.conf'
+    command: 'postgres -c config_file=/etc/postgresql/postgresql.conf'
+    networks: [ 'task-backend' ]
+    healthcheck:
+      test: [ 'CMD', 'pg_isready', '-U', 'postgres', '-d', 'postgres' ]
+      interval: '30s'
+      timeout: '10s'
+      retries: 5
+      start_period: '15s'
+      start_interval: '15s'
+
+  event-bus:
+    container_name: 'event-bus'
+    image: 'apache/kafka:4.2.1'
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://localhost:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://event-bus:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+    networks: [ 'task-backend' ]
+    healthcheck:
+      test: [ 'CMD-SHELL', '/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1' ]
+      start_period: '30s'
+      interval: '10s'
+      timeout: '10s'
+      retries: 3
+
+  event-bus-init:
+    container_name: 'event-bus-init'
+    image: 'apache/kafka:4.2.1'
+    entrypoint: [ '/bin/sh', '-c' ]
+    command: >
+      /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server event-bus:9092 --topic jbat.tap.user.deleted --partitions 3 --replication-factor 1 &&  /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server event-bus:9092 --topic jbat.tap.email.verification --partitions 3 --replication-factor 1 && /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server event-bus:9092 --topic jbat.tap.user.registered --partitions 3 --replication-factor 1 && /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server event-bus:9092 --topic jbat.tap.user.login --partitions 3 --replication-factor 1 && /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --bootstrap-server event-bus:9092 --topic jbat.tap.user.password-change --partitions 3 --replication-factor 1
+    networks: [ 'task-backend' ]
+    depends_on:
+      event-bus:
+        condition: 'service_healthy'
+    restart: 'no'
+
+  otlp-collector:
+    container_name: 'alloy-otlp-collector'
+    image: 'grafana/alloy:v1.16.1'
+    volumes:
+      - './deployments/alloy/config.alloy:/etc/alloy/config.alloy:ro'
+    command:
+      - 'run'
+      - '/etc/alloy/config.alloy'
+      - '--server.http.listen-addr=0.0.0.0:12345'
+      - '--stability.level=generally-available'
+    ports: [ '12345:12345' ]
+    networks: [ 'task-backend' ]
+    depends_on:
+      - 'prometheus'
+      - 'tempo'
+      - 'loki'
+    restart: 'unless-stopped'
+
+  prometheus:
+    container_name: 'prometheus'
+    image: 'prom/prometheus:v3.12.0'
+    volumes:
+      - './deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro'
+      - 'prometheus-data:/prometheus'
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-remote-write-receiver'
+      - '--web.enable-lifecycle'
+    networks: [ 'task-backend' ]
+    restart: 'unless-stopped'
+
+  tempo:
+    container_name: 'tempo'
+    image: 'grafana/tempo:main-58cf61d'
+    volumes:
+      - './deployments/tempo/tempo.yml:/etc/tempo/tempo.yml:ro'
+      - 'tempo-data:/var/tempo'
+    command:
+      - '-config.file=/etc/tempo/tempo.yml'
+    networks: [ 'task-backend' ]
+    restart: 'unless-stopped'
+
+  loki:
+    container_name: 'loki'
+    image: 'grafana/loki:main-2e3da9a'
+    volumes:
+      - './deployments/loki/loki.yml:/etc/loki/loki.yml:ro'
+      - 'loki-data:/loki'
+    command:
+      - '-config.file=/etc/loki/loki.yml'
+    networks: [ 'task-backend' ]
+    restart: 'unless-stopped'
+
+  grafana:
+    container_name: 'grafana'
+    image: 'grafana/grafana:main-ubuntu-slim'
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true'
+      GF_AUTH_ANONYMOUS_ORG_ROLE: 'Admin'
+      GF_AUTH_DISABLE_LOGIN_FORM: 'true'
+    volumes:
+      - './deployments/grafana/provisioning/:/etc/grafana/provisioning/:ro'
+      - 'grafana-data:/var/lib/grafana'
+    ports: [ '3001:3000' ]
+    networks: [ 'task-backend' ]
+    depends_on:
+      - 'loki'
+      - 'tempo'
+      - 'prometheus'
+    restart: 'unless-stopped'
+
+networks:
+  task-backend:
+    driver: 'bridge'
+
+volumes:
+  postgis-data:
+    name: 'postgis-data'
+  prometheus-data:
+    name: 'prometheus-data'
+  tempo-data:
+    name: 'tempo-data'
+  loki-data:
+    name: 'loki-data'
+  grafana-data:
+    name: 'grafana-data'
